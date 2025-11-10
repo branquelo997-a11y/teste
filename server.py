@@ -5,6 +5,7 @@ import threading
 import time
 import logging
 import random
+import urllib.parse
 from flask import Flask, jsonify
 
 # ----------------------
@@ -21,18 +22,54 @@ SEND_INTERVAL = int(os.environ.get("SEND_INTERVAL", "30"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "10"))
 
 # ----------------------
-# Proxies dinâmicas via Railway
-# Exemplo no painel Railway:
-# PROXIES=http://user1:pass1@geo.iproyal.com:12321,http://user2:pass2@geo.iproyal.com:12321
+# Função para normalizar proxies
 # ----------------------
-PROXIES = os.environ.get("PROXIES", "").split(",")
-PROXIES = [p.strip() for p in PROXIES if p.strip()]
+def normalize_proxy(raw: str) -> str:
+    """
+    Aceita:
+      - http://user:pass@host:port
+      - https://user:pass@host:port
+      - host:port:user:pass
+      - host:porta:user:senha
+      - host:port
+    Retorna uma proxy string pronta para usar em requests, ex: http://user:pass@host:port
+    """
+    raw = raw.strip()
+    if not raw:
+        return None
+
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw
+
+    parts = raw.split(":")
+    if len(parts) >= 4:
+        host = parts[0]
+        port = parts[1]
+        user = parts[2]
+        pwd = ":".join(parts[3:])
+        user_enc = urllib.parse.quote(user, safe="")
+        pwd_enc = urllib.parse.quote(pwd, safe="")
+        return f"http://{user_enc}:{pwd_enc}@{host}:{port}"
+
+    if len(parts) == 2:
+        host, port = parts
+        return f"http://{host}:{port}"
+
+    return raw
+
+# ----------------------
+# Leitura de proxies via variável de ambiente
+# ----------------------
+raw_proxies = os.environ.get("PROXIES", "")
+PROXIES = [normalize_proxy(p) for p in raw_proxies.split(",") if p.strip()]
 
 if not PROXIES:
     logging.warning("[WARN] Nenhuma proxy configurada — as requisições serão diretas.")
+else:
+    logging.info(f"[INIT] {len(PROXIES)} proxies carregadas.")
 
 # ----------------------
-# Função para obter todos os servidores Roblox
+# Função para coletar servidores Roblox
 # ----------------------
 def fetch_all_roblox_servers(retries=3):
     all_servers = []
@@ -104,7 +141,7 @@ def fetch_and_send():
         time.sleep(SEND_INTERVAL)
 
 # ----------------------
-# Hilo em background
+# Thread em background
 # ----------------------
 threading.Thread(target=fetch_and_send, daemon=True).start()
 
