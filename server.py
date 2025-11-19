@@ -16,18 +16,15 @@ app = Flask(__name__)
 # ==============================
 
 GAME_ID = os.environ.get("GAME_ID", "109983668079237")
-
-# URL base SEM cursor e SEM sortOrder (será aplicado dinamicamente)
-BASE_URL = f"https://games.roblox.com/v1/games/{GAME_ID}/servers/Public"
-
+BASE_URL = f"https://games.roblox.com/v1/games/{GAME_ID}/servers/Public?sortOrder=Asc"
 MAIN_API_URL = os.environ.get("MAIN_API_URL", "https://main-jobid-production.up.railway.app/add-pool")
 
 SEND_INTERVAL = int(os.environ.get("SEND_INTERVAL", "30"))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "10"))
 SEND_MIN_SERVERS = int(os.environ.get("SEND_MIN_SERVERS", "1"))
-MAX_PAGES_PER_CYCLE = int(os.environ.get("MAX_PAGES_PER_CYCLE", "20"))
+MAX_PAGES_PER_CYCLE = int(os.environ.get("MAX_PAGES_PER_CYCLE", "10"))
 
-# Filtro de players
+# 👉 NOVO: filtro de players
 MIN_PLAYERS = int(os.environ.get("MIN_PLAYERS", "0"))
 MAX_PLAYERS = int(os.environ.get("MAX_PLAYERS", "999"))
 
@@ -39,105 +36,77 @@ def normalize_proxy(raw: str) -> str:
     raw = raw.strip()
     if not raw:
         return None
-
     if raw.startswith("http://") or raw.startswith("https://"):
         return raw
-
     parts = raw.split(":")
     if len(parts) >= 4:
         host = parts[0]
         port = parts[1]
         user = parts[2]
         pwd = ":".join(parts[3:])
-
         user_enc = urllib.parse.quote(user, safe="")
         pwd_enc = urllib.parse.quote(pwd, safe="")
-
         return f"http://{user_enc}:{pwd_enc}@{host}:{port}"
-
     if len(parts) == 2:
         host, port = parts
         return f"http://{host}:{port}"
-
     return raw
-
 
 raw_proxies = os.environ.get("PROXIES", "")
 PROXIES = [normalize_proxy(p) for p in raw_proxies.split(",") if p.strip()]
 
-if PROXIES:
-    logging.info(f"[INIT] {len(PROXIES)} proxies carregadas.")
-else:
+if not PROXIES:
     logging.warning("[WARN] Nenhuma proxy configurada — requisições diretas.")
-
+else:
+    logging.info(f"[INIT] {len(PROXIES)} proxies carregadas.")
 
 # ==============================
-# FETCH SERVERS – ULTRA TURBO
+# FETCH SERVERS
 # ==============================
 
 def fetch_all_roblox_servers(retries=3):
     all_servers = []
-    proxy_fail_count = 0
+    cursor = None
     page_count = 0
+    proxy_index = 0
 
-    # vamos coletar tanto Asc quanto Desc (muito mais servidores)
-    for order in ["Asc", "Desc"]:
+    while True:
+        proxy = random.choice(PROXIES) if PROXIES else None
+        proxies = {"http": proxy, "https": proxy} if proxy else None
 
-        # chance de iniciar no cursor aleatório
-        cursor = None
-        if random.random() < 0.75:
-            cursor = str(random.randint(10000, 999999))
+        try:
+            url = BASE_URL + (f"&cursor={cursor}" if cursor else "")
+            page_count += 1
+            logging.info(f"[FETCH] Página {page_count} via {proxy or 'sem proxy'}...")
 
-        while True:
-            # Seleciona proxy
-            proxy = random.choice(PROXIES) if PROXIES else None
-            proxies = {"http": proxy, "https": proxy} if proxy else None
-
-            try:
-                # Monta URL
-                url = f"{BASE_URL}?sortOrder={order}&limit=100"
-                if cursor:
-                    url += f"&cursor={cursor}"
-
-                page_count += 1
-                logging.info(f"[FETCH] {order} | Página {page_count} via {proxy or 'sem proxy'}")
-
-                r = requests.get(url, proxies=proxies, timeout=REQUEST_TIMEOUT)
-
-                # rate limit
-                if r.status_code == 429:
-                    logging.warning("[429] Too Many Requests — trocando proxy imediatamente...")
-                    continue  # tenta novamente com outra proxy
-
-                r.raise_for_status()
-                data = r.json()
-
-                # Coleta
-                servers = data.get("data", [])
-                all_servers.extend(servers)
-
-                logging.info(f"[PAGE {page_count}] +{len(servers)} servers (Total: {len(all_servers)})")
-
-                cursor = data.get("nextPageCursor")
-
-                # limite atingido
-                if not cursor or page_count >= MAX_PAGES_PER_CYCLE:
-                    break
-
-                time.sleep(0.2)
-
-            except requests.exceptions.RequestException as e:
-                logging.warning(f"[ERRO] Proxy {proxy or 'sem proxy'} falhou: {e}")
-                proxy_fail_count += 1
-
-                if proxy_fail_count >= retries * max(1, len(PROXIES)):
-                    logging.error("[FATAL] Muitas falhas consecutivas. Abortando ciclo.")
-                    break
-
+            r = requests.get(url, proxies=proxies, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 429:
+                logging.warning("[429] Too Many Requests — trocando de proxy...")
+                time.sleep(1)
                 continue
 
-    return all_servers
+            r.raise_for_status()
+            data = r.json()
+            servers = data.get("data", [])
+            all_servers.extend(servers)
+            cursor = data.get("nextPageCursor")
 
+            logging.info(f"[PAGE {page_count}] +{len(servers)} servers (Total: {len(all_servers)})")
+
+            if not cursor or page_count >= MAX_PAGES_PER_CYCLE:
+                logging.info(f"[INFO] Limite de páginas atingido ({page_count}/{MAX_PAGES_PER_CYCLE}).")
+                break
+
+            time.sleep(0.5)
+
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"[ERRO] Proxy {proxy or 'sem proxy'} falhou: {e}")
+            time.sleep(1)
+            proxy_index += 1
+            if proxy_index >= (len(PROXIES) or 1) * retries:
+                break
+
+    return all_servers
 
 # ==============================
 # LOOP PRINCIPAL
@@ -148,18 +117,21 @@ def fetch_and_send():
         servers = fetch_all_roblox_servers()
         total_servers = len(servers)
 
-        if total_servers == 0:
+        if not servers:
             logging.warning("⚠️ Nenhum servidor encontrado.")
             time.sleep(SEND_INTERVAL)
             continue
 
-        # FILTRAR JOB IDS POR PLAYERS
+        # ============================
+        # FILTRO POR PLAYERS
+        # ============================
         job_ids = [
-            s["id"] for s in servers
+            s["id"]
+            for s in servers
             if "id" in s and MIN_PLAYERS <= s.get("playing", 0) <= MAX_PLAYERS
         ]
 
-        logging.info(f"[FILTER] {len(job_ids)} servers válidos após filtro ({MIN_PLAYERS}–{MAX_PLAYERS} players)")
+        logging.info(f"[FILTER] {len(job_ids)} servers após filtro ({MIN_PLAYERS}–{MAX_PLAYERS} players)")
 
         if len(job_ids) < SEND_MIN_SERVERS:
             logging.info(f"[SKIP] Apenas {len(job_ids)} válidos (mínimo: {SEND_MIN_SERVERS}).")
@@ -168,7 +140,6 @@ def fetch_and_send():
 
         payload = {"servers": job_ids}
 
-        # enviar para main
         try:
             resp = requests.post(MAIN_API_URL, json=payload, timeout=REQUEST_TIMEOUT)
             if resp.ok:
@@ -182,14 +153,11 @@ def fetch_and_send():
 
         time.sleep(SEND_INTERVAL)
 
-
-# thread do coletor rodando em background
+# Thread do loop
 threading.Thread(target=fetch_and_send, daemon=True).start()
 
-
-
 # ==============================
-# ENDPOINT HTTP
+# ENDPOINT
 # ==============================
 
 @app.route("/", methods=["GET"])
@@ -205,9 +173,8 @@ def home():
         "max_players": MAX_PLAYERS
     })
 
-
 # ==============================
-# RUN SERVER
+# RUN
 # ==============================
 
 if __name__ == "__main__":
